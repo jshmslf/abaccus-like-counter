@@ -1,13 +1,14 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+from pydantic import BaseModel
 import httpx
 import os
 from dotenv import load_dotenv
 from psycopg_pool import AsyncConnectionPool
 
 load_dotenv()
-DATABASE_URL = os.environ["DATABASE_URL"]  # Neon connection string
+DATABASE_URL = os.environ["DATABASE_URL"]
 
 pool: AsyncConnectionPool
 
@@ -28,55 +29,55 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def get_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host or "unknown"
+ABACUS_BASE = "https://abacus.jasoncameron.dev"
+ABACUS_KEY  = "jshmslf.is-a.dev/portfolio-likes"
+
+class LikePayload(BaseModel):
+    token: str
+    count: int  # batch count from debounce
 
 @app.get("/api/like")
-async def get_like(request: Request):
-    ip = get_ip(request)
-
+async def get_like(token: str):
     async with pool.connection() as conn:
-        row = await conn.execute(
-            "SELECT count FROM likes_visitors WHERE ip = %s", (ip,)
-        )
-        row = await row.fetchone()
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT count FROM likes_visitors WHERE token = %s", (token,)
+            )
+            row = await cur.fetchone()
     visitor_likes = row[0] if row else 0
 
     async with httpx.AsyncClient() as client:
-        res = await client.get(
-            "https://abacus.jasoncameron.dev/get/jshmslf.is-a.dev/portfolio-likes"
-        )
+        res = await client.get(f"{ABACUS_BASE}/get/{ABACUS_KEY}")
     total_likes = res.json().get("value", 0)
 
     return {"total_likes": total_likes, "visitor_likes": visitor_likes}
 
 @app.post("/api/like")
-async def post_like(request: Request):
-    ip = get_ip(request)
+async def post_like(payload: LikePayload):
+    token = payload.token
+    count = max(1, min(payload.count, 100))  # clamp between 1–100 to prevent abuse
 
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
                 """
-                INSERT INTO likes_visitors (ip, count)
-                VALUES (%s, 1)
-                ON CONFLICT (ip) DO UPDATE
-                SET count = likes_visitors.count + 1,
-                    updated_at = NOW()
+                INSERT INTO likes_visitors (token, count)
+                VALUES (%s, %s)
+                ON CONFLICT (token) DO UPDATE
+                  SET count = likes_visitors.count + EXCLUDED.count,
+                      updated_at = NOW()
                 RETURNING count
                 """,
-                (ip,),
+                (token, count),
             )
             row = await cur.fetchone()
     visitor_likes = row[0]
 
+    # Hit Abacus `count` times to match the batch
+    total_likes = 0
     async with httpx.AsyncClient() as client:
-        res = await client.get(
-            "https://abacus.jasoncameron.dev/hit/jshmslf.is-a.dev/portfolio-likes"
-        )
-    total_likes = res.json().get("value", 0)
+        for _ in range(count):
+            res = await client.get(f"{ABACUS_BASE}/hit/{ABACUS_KEY}")
+        total_likes = res.json().get("value", 0)
 
     return {"total_likes": total_likes, "visitor_likes": visitor_likes}
